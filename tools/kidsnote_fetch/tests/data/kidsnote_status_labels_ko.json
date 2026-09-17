@@ -1,0 +1,87 @@
+{
+  "_source": "kidsnote.com /kr/report/<id> __NEXT_DATA__ i18n store (namespace 'common'): report.status.<field>.<code> and common.weather.<code>; captured 2026-09-14",
+  "meal_status": {
+    "fixed": "정량",
+    "less": "적게",
+    "ml_free": "자율배식",
+    "ml_one": "1회",
+    "ml_two": "2회",
+    "more": "많이",
+    "none": "안했음"
+  },
+  "sleep_hour": {
+    "1.5_to_2": "1시간30분~2시간",
+    "1_to_1.5": "1시간~1시간30분",
+    "below_1": "1시간 미만",
+    "no_sleep": "잠을 안 잤어요",
+    "over_2": "2시간 이상",
+    "sleep_hardly": "잠을 설쳤어요",
+    "sleep_late": "늦잠 잤어요",
+    "sleep_well": "잠을 푹 잤어요",
+    "slp_bad": "부족",
+    "slp_good": "단잠",
+    "slp_normal": "보통"
+  },
+  "bowel_status": {
+    "average": "보통",
+    "bw_no": "안했음",
+    "bw_one": "1회",
+    "bw_two": "2회",
+    "diarrhea": "설사",
+    "hard": "딱딱함",
+    "none": "안했음",
+    "watery": "묽음"
+  },
+  "temperature_status": {
+    "high": "고열",
+    "normal": "정상",
+    "slight": "미열"
+  },
+  "mood_status": {
+    "average": "보통",
+    "bad": "나쁨",
+    "good": "좋음"
+  },
+  "health_status": {
+    "average": "보통",
+    "bad": "나쁨",
+    "good": "좋음"
+  },
+  "outdoor_activity_status": {
+    "false": "X",
+    "true": "O"
+  },
+  "bath_status": {
+    "bath": "목욕",
+    "none": "안했음",
+    "shower": "샤워"
+  },
+  "nail_status": {
+    "cut": "자름",
+    "ok": "양호"
+  },
+  "activity_rate": {
+    "10": "적극적",
+    "20": "보통",
+    "30": "소극적"
+  },
+  "weather": {
+    "cloudy": "흐림",
+    "fog": "안개",
+    "hail": "우박",
+    "mixed_rain_snow": "눈비/비눈",
+    "mostly_cloudy": "구름많음",
+    "none": "표시안함",
+    "overcast": "흐림",
+    "partly_cloudy": "구름조금",
+    "rain": "비",
+    "shower": "소나기",
+    "shower_rain": "소나기",
+    "snow": "눈",
+    "sunny": "맑음",
+    "sunny_after_rain": "비온후갬",
+    "thunderstorm": "낙뢰",
+    "undefined": "표시안함",
+    "yellow_sand": "황사"
+  }
+}

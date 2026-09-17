@@ -1,0 +1,45 @@
+# Unit tests for the login / notify-once scripts and the mirror workflow.
+# Runs only in the original repo when that code changes; forks receive this
+# file through "Sync fork" but the job is skipped there. No secrets and no
+# network: kidsnote and the GitHub API are replaced by a local fake server.
+
+name: 개발자용 테스트 (사용자는 실행할 필요 없음)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tools/kidsnote_fetch/**"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "tools/kidsnote_fetch/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    if: github.repository == 'redchupa/kidsnote-backup'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The mirror workflow's login step runs on the runner's system
+      # python3, so test with that same interpreter (no setup-python).
+      - name: Show python version
+        run: python3 --version
+
+      # A venv keeps the same interpreter but avoids the system pip lock (PEP 668).
+      - name: Install test dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r tools/kidsnote_fetch/requirements.txt pyyaml
+
+      - name: Run unit tests
+        env:
+          PYTHONIOENCODING: utf-8
+        run: .venv/bin/python -m unittest discover -s tools/kidsnote_fetch/tests -p "test_*.py" -v

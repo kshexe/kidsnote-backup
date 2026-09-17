@@ -37,6 +37,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from secret_input import clean_secret, mask_name  # local module
+
 try:
     import browser_cookie3
 except ImportError:  # surface a clear hint before the first call
@@ -544,21 +546,21 @@ def _pick_child(
     if child_id is not None:
         match = next((c for c in children if c.get("id") == child_id), None)
         if match is None:
-            avail = ", ".join(f"{c.get('id')}={c.get('name')}" for c in children)
+            avail = ", ".join(f"{c.get('id')}={mask_name(c.get('name'))}" for c in children)
             sys.exit(f"--child-id {child_id} not in your profile. Available: {avail}")
         return match
     if child_name:
-        needle = child_name.strip().lower()
+        needle = clean_secret(child_name).lower()
         matches = [c for c in children if needle in (c.get("name") or "").lower()]
         if len(matches) == 0:
-            avail = ", ".join(f"{c.get('id')}={c.get('name')}" for c in children)
+            avail = ", ".join(f"{c.get('id')}={mask_name(c.get('name'))}" for c in children)
             sys.exit(
-                f"--child-name {child_name!r} matched no child. Available: {avail}"
+                f"--child-name {mask_name(child_name)!r} matched no child. Available: {avail}"
             )
         if len(matches) > 1:
-            avail = ", ".join(f"{c.get('id')}={c.get('name')}" for c in matches)
+            avail = ", ".join(f"{c.get('id')}={mask_name(c.get('name'))}" for c in matches)
             sys.exit(
-                f"--child-name {child_name!r} ambiguous ({len(matches)} matches): "
+                f"--child-name {mask_name(child_name)!r} ambiguous ({len(matches)} matches): "
                 f"{avail}. Use --child-id instead for an exact pick."
             )
         return matches[0]
@@ -588,8 +590,9 @@ def main(argv: list[str] | None = None) -> int:
                          "process env (whichever is set).")
     ap.add_argument("--auth-mode", default="session-cookie-env",
                     choices=["session-cookie-env", "browser-cookie"],
-                    help="session-cookie-env (default): reads KIDSNOTE_SESSION_COOKIE "
-                         "(value of `sessionid`) from env. Required for headless CI. "
+                    help="session-cookie-env (default): logs in with KIDSNOTE_USERNAME / "
+                         "KIDSNOTE_PASSWORD, falling back to KIDSNOTE_SESSION_COOKIE "
+                         "(value of `sessionid`). Required for headless CI. "
                          "browser-cookie: pulls cookies from a locally logged-in browser.")
     ap.add_argument("--env-file", type=Path,
                     default=Path(__file__).resolve().parents[2] / ".env",
@@ -657,6 +660,10 @@ def main(argv: list[str] | None = None) -> int:
                          "after prompt/LLM changes so old callouts get "
                          "regenerated. Sentinel dashboard pages are never "
                          "touched by this — they're always replaced anyway.")
+    ap.add_argument("--relabel-existing", action="store_true",
+                    help="Rewrite outdated label text (life-record chips, weather callout, "
+                         "bowel lines) on already-published report pages in place, only where "
+                         "it matches what an older version rendered. Pages keep their links.")
     ap.add_argument("--dump-raw", action="store_true",
                     help="Dump the raw /reports/ JSON to backup_root for inspection. "
                          "Ignored when --no-local-save is set.")
@@ -678,16 +685,34 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- auth -----
     if args.auth_mode == "session-cookie-env":
+        from kidsnote_auth import AuthError, resolve_session  # local module
+        username = _resolve_secret(env, "KIDSNOTE_USERNAME")
+        password = _resolve_secret(env, "KIDSNOTE_PASSWORD")
         cookie_val = _resolve_secret(env, "KIDSNOTE_SESSION_COOKIE")
-        if not cookie_val:
+        if not (username and password) and not cookie_val:
             sys.exit(
-                "KIDSNOTE_SESSION_COOKIE missing. Extract the `sessionid` cookie "
-                "value for kidsnote.com from a logged-in browser session and "
-                "set it in .env (local) or as a repo secret (GitHub Actions)."
+                "Kidsnote credentials missing. Set KIDSNOTE_USERNAME + "
+                "KIDSNOTE_PASSWORD (auto-login) or KIDSNOTE_SESSION_COOKIE "
+                "in .env (local) or as repo secrets (GitHub Actions)."
+            )
+        # Validates the session up front, so a dead login stops here before
+        # any Notion work. In CI the "Kidsnote login" workflow step already
+        # logged in and passes the fresh sessionid via KIDSNOTE_SESSION_COOKIE.
+        try:
+            session = resolve_session(username, password, cookie_val, USER_AGENT)
+        except AuthError as e:
+            sys.exit(f"Kidsnote login failed ({e.reason}): {e}")
+        if session.login_error is not None:
+            _LOGGER.warning(
+                "Kidsnote id/password login failed (%s: %s); continuing with KIDSNOTE_SESSION_COOKIE",
+                session.login_error.reason, session.login_error,
             )
         sess = _baseline_session()
-        sess.cookies.set("sessionid", cookie_val, domain="www.kidsnote.com", path="/")
-        _LOGGER.info("Using sessionid from KIDSNOTE_SESSION_COOKIE env var")
+        sess.cookies.set("sessionid", session.sessionid, domain="www.kidsnote.com", path="/")
+        _LOGGER.info(
+            "Kidsnote session ready (%s)",
+            "fresh login" if session.source == "login" else "KIDSNOTE_SESSION_COOKIE",
+        )
     else:
         sess = _load_session_from_browser(args.browser)
 
@@ -781,7 +806,7 @@ def main(argv: list[str] | None = None) -> int:
         _LOGGER.info(
             "Account has %d child(ren): %s",
             len(children),
-            ", ".join(f"#{i + 1} id={c.get('id')} name={c.get('name')}"
+            ", ".join(f"#{i + 1} id={c.get('id')} name={mask_name(c.get('name'))}"
                       for i, c in enumerate(children)),
         )
     # Resolve which child to mirror. CLI flag wins over env var so a manual
@@ -790,7 +815,7 @@ def main(argv: list[str] | None = None) -> int:
     target = _pick_child(children, args.child_id, child_name, args.child_index)
     _LOGGER.info(
         "Selected child: id=%s name=%s (override with --child-id / --child-name / KIDSNOTE_CHILD_NAME)",
-        target.get("id"), target.get("name"),
+        target.get("id"), mask_name(target.get("name")),
     )
 
     reports = _list_reports(sess, int(target["id"]))
@@ -826,6 +851,21 @@ def main(argv: list[str] | None = None) -> int:
                 _LOGGER.info("  detail enrich %d/%d done", i, len(reports))
         reports = enriched
         _LOGGER.info("detail enrich complete")
+
+    # ---- --relabel-existing: fix label wording on already-published pages ----
+    if args.relabel_existing and mirror is not None and reports:
+        if args.force_refresh:
+            _LOGGER.info("🏷️ Relabel skipped: --force-refresh re-publishes every page anyway")
+        else:
+            from relabel import relabel_report_pages  # local module
+            _LOGGER.info("🏷️ Relabel: checking %d published report pages...",
+                         sum(1 for r in reports if int(r.get("id") or 0) in page_map))
+            relabel_counts = relabel_report_pages(
+                mirror, reports, page_map,
+                time_left=lambda: _remaining_budget() - DASHBOARD_RESERVE_SEC,
+            )
+            _LOGGER.info("🏷️ Relabel done: %s",
+                         ", ".join(f"{k}={v}" for k, v in relabel_counts.items()))
 
     # ---- local save (optional) -----
     total_new_files = 0

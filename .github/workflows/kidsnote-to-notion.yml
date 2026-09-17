@@ -1,20 +1,26 @@
 # Kidsnote → Notion mirror
 #
-# MANUAL EXECUTION ONLY. Kidsnote's login flow can no longer be driven by
-# a headless HTTP client (the page is a Next.js SPA). So the workflow
-# relies on a `sessionid` cookie the operator extracts manually from a
-# logged-in browser session (Chrome F12 → Application → Cookies) and
-# stores in the KIDSNOTE_SESSION_COOKIE secret. That cookie typically
-# lasts ~30 days; when it expires, re-extract and re-run.
+# Runs on a 6h cron. Each run logs in to kidsnote with KIDSNOTE_USERNAME /
+# KIDSNOTE_PASSWORD through the same JSON API the web login page uses, so
+# there is no cookie to refresh. KIDSNOTE_SESSION_COOKIE (a `sessionid`
+# copied from a browser, valid 14 days after login) is only a fallback for
+# accounts that can't log in headlessly, e.g. with 2-step verification on.
 #
 # Dedup: each new Notion page records the kidsnote `Report ID`. Subsequent
 # runs query the DB once at startup and skip reports whose id is already
 # stored, so re-running is safe and idempotent.
 #
 # Required GitHub repository secrets (Settings → Secrets and variables → Actions):
-#   KIDSNOTE_SESSION_COOKIE   value of the `sessionid` cookie for kidsnote.com
-#   NOTION_TOKEN              internal integration token from notion.so/profile/integrations
-#   NOTION_DATABASE_ID        32-char hex id from your Notion DB URL
+#   KIDSNOTE_USERNAME         kidsnote login id
+#   KIDSNOTE_PASSWORD         kidsnote password
+#                             (or KIDSNOTE_SESSION_COOKIE: `sessionid` cookie, expires in 14 days)
+#   KIDSNOTE_CHILD_NAME       the child's name (or part of it)
+#   NOTION_TOKEN              Notion connection token (app.notion.com/developers/connections)
+#   NOTION_DATABASE_ID        link of the Notion page to back up into (a blank page is fine:
+#                             its database is created on the first run), or a database id
+#   AI_FEATURES               on / off
+# More children in the same fork: KIDSNOTE_CHILD_NAME_N + NOTION_DATABASE_ID_N
+# (N = 2-5); the plan job starts one parallel backup job per child.
 
 name: Kidsnote → Notion mirror
 
@@ -42,6 +48,12 @@ on:
         default: "off"
         type: choice
         options: ["off", "on"]
+      relabel:
+        description: "🏷️ 예전 페이지 문구 고치기 — 이미 백업된 알림장에 남은 영어 코드(watery 등)나 옛 표현을 키즈노트 표현으로 고칩니다. 페이지·사진·링크는 그대로. 코드 업데이트 후 한 번만. 평소엔 off."
+        required: false
+        default: "off"
+        type: choice
+        options: ["off", "on"]
       # ---- Multi-child accounts ----
       # Like the AI master toggle, the child selector now lives in repo
       # Secrets/Variables (``KIDSNOTE_CHILD_NAME``) rather than as a
@@ -52,11 +64,10 @@ on:
       # and re-dispatch manually each time. Single source of truth via
       # secret keeps cron and manual dispatch in sync without surprise.
       #
-      # Per-fork: ``KIDSNOTE_CHILD_NAME`` = name substring (e.g. "하린").
-      # Multi-child in ONE fork: also set ``KIDSNOTE_CHILD_NAME_2``,
-      # ``KIDSNOTE_CHILD_NAME_3`` etc with matching session/db slots.
-      # See README "자녀가 여러 명일 때" section for the recommended
-      # one-fork-per-child layout (parallel runs, ~2× faster).
+      # ``KIDSNOTE_CHILD_NAME`` = name substring (e.g. "하린"). More children
+      # in the same fork: ``KIDSNOTE_CHILD_NAME_2`` + ``NOTION_DATABASE_ID_2``
+      # (up to _5); the plan job starts one parallel job per child. GitHub
+      # allows only one fork per account, so there is no fork-per-child.
 
       # ---- AI master toggle: secret/variable AI_FEATURES (only) ----
       # The AI master toggle lives ONLY in repo Secrets/Variables now —
@@ -100,31 +111,97 @@ on:
 
 permissions:
   contents: read
+  # actions: write lets the keepalive step below re-enable this
+  # workflow so GitHub's 60-day inactivity rule can't switch cron off.
+  actions: write
 
 concurrency:
   group: kidsnote-to-notion
   cancel-in-progress: false
 
 jobs:
-  mirror:
+  # Which children to back up: always slot 1 (its check reports missing
+  # settings), plus slot N when the NOTION_DATABASE_ID_N secret is set. Only
+  # slot labels leave this job, never secret values.
+  plan:
     runs-on: ubuntu-latest
-    # Long timeout: a 1-year backfill with photo-heavy reports
-    # (avg 15-25 images/report + Ollama-driven LLM dashboards) ran past
-    # the 6h cap on the first try, so we ask for 12h. GitHub-hosted
-    # runners cap public repos at 35 hours of wall-time per workflow.
-    # Re-runs after the first backfill are fast (dedup skips done).
-    timeout-minutes: 720
+    outputs:
+      slots: ${{ steps.find.outputs.slots }}
+    steps:
+      - name: Find configured children
+        id: find
+        env:
+          DB_2: ${{ secrets.NOTION_DATABASE_ID_2 }}
+          DB_3: ${{ secrets.NOTION_DATABASE_ID_3 }}
+          DB_4: ${{ secrets.NOTION_DATABASE_ID_4 }}
+          DB_5: ${{ secrets.NOTION_DATABASE_ID_5 }}
+        run: |
+          slots='[{"suffix":"","label":"1"}'
+          for n in 2 3 4 5; do
+            var="DB_$n"
+            if [ -n "$(printf '%s' "${!var}" | tr -d '[:space:]')" ]; then
+              slots="$slots,{\"suffix\":\"_$n\",\"label\":\"$n\"}"
+            fi
+          done
+          echo "slots=$slots]" >> "$GITHUB_OUTPUT"
+
+  # One job per child, in parallel. Child N reads KIDSNOTE_CHILD_NAME_N and
+  # NOTION_DATABASE_ID_N; NOTION_TOKEN_N falls back to NOTION_TOKEN, so one
+  # Notion connection can serve every child's page.
+  mirror:
+    needs: plan
+    name: 백업 (자녀 ${{ matrix.slot.label }})
+    runs-on: ubuntu-latest
+    # GitHub-hosted jobs stop at 6 hours regardless; fetch.py exits cleanly
+    # before that and the next cron run resumes where it left off.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: ${{ fromJSON(needs.plan.outputs.slots) }}
 
     steps:
       - uses: actions/checkout@v4
 
+      # Check everything a run needs before installing anything (stdlib-only
+      # script): kidsnote login, KIDSNOTE_CHILD_NAME, Notion token and page
+      # access. A problem ends the run in seconds with a Korean hint; on
+      # success the fresh kidsnote sessionid is exported (masked) to later
+      # steps as KIDSNOTE_SESSION_COOKIE.
+      - name: Check login and settings
+        id: auth
+        env:
+          KIDSNOTE_USERNAME: ${{ secrets.KIDSNOTE_USERNAME }}
+          KIDSNOTE_PASSWORD: ${{ secrets.KIDSNOTE_PASSWORD }}
+          KIDSNOTE_SESSION_COOKIE: ${{ secrets.KIDSNOTE_SESSION_COOKIE }}
+          KIDSNOTE_CHILD_NAME: ${{ secrets[format('KIDSNOTE_CHILD_NAME{0}', matrix.slot.suffix)] || vars[format('KIDSNOTE_CHILD_NAME{0}', matrix.slot.suffix)] || '' }}
+          NOTION_TOKEN: ${{ secrets[format('NOTION_TOKEN{0}', matrix.slot.suffix)] || secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets[format('NOTION_DATABASE_ID{0}', matrix.slot.suffix)] }}
+        run: python3 tools/kidsnote_fetch/preflight.py --github
+
+      # One email per outage instead of one every 6 hours: this fails (so
+      # GitHub sends one failure email) only if the previous run didn't
+      # already report the login failure; otherwise the run ends green with
+      # a warning. Fixing the secret is enough, the next run resumes.
+      # !cancelled(): also report when the login step itself crashed.
+      - name: Kidsnote login failed - notify once
+        if: ${{ !cancelled() && steps.auth.outputs.ok != 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          JOB_NAME: 백업 (자녀 ${{ matrix.slot.label }})
+          REASON: ${{ steps.auth.outputs.reason }}
+          HINT: ${{ steps.auth.outputs.hint }}
+        run: python3 tools/kidsnote_fetch/notify_once.py
+
       - name: Set up Python
+        if: steps.auth.outputs.ok == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install fetcher deps + image helpers
+        if: steps.auth.outputs.ok == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r tools/kidsnote_fetch/requirements.txt
@@ -154,15 +231,26 @@ jobs:
       # dispatch and cron stay in sync without any second toggle.
       - name: Resolve effective AI toggle
         id: ai
+        if: steps.auth.outputs.ok == 'true'
         env:
           REPO_VAR_AI: ${{ vars.AI_FEATURES }}
           REPO_SECRET_AI: ${{ secrets.AI_FEATURES }}
+          GROWTH_STORY: ${{ secrets.GROWTH_STORY || vars.GROWTH_STORY }}
+          MILESTONES: ${{ secrets.MILESTONES || vars.MILESTONES }}
+          INTERESTS: ${{ secrets.INTERESTS || vars.INTERESTS }}
+          TEACHER_THANKS: ${{ secrets.TEACHER_THANKS || vars.TEACHER_THANKS }}
         run: |
-          if [ "$REPO_VAR_AI" = "on" ] || [ "$REPO_SECRET_AI" = "on" ]; then
-            echo "value=on" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=off" >> "$GITHUB_OUTPUT"
-          fi
+          # Forgiving on/off: "On", " on", "켜기" all count, so a stray space or
+          # capital letter in a secret doesn't silently flip a setting.
+          norm() { printf '%s' "$1" | sed 's/\xEF\xBB\xBF//g' | tr -d "[:space:]\"'" | tr '[:upper:]' '[:lower:]'; }
+          is_on()  { case "$(norm "$1")" in on|true|yes|y|1|켜기|켬) return 0 ;; esac; return 1; }
+          is_off() { case "$(norm "$1")" in off|false|no|n|0|끄기|끔) return 0 ;; esac; return 1; }
+          if is_on "$REPO_VAR_AI" || is_on "$REPO_SECRET_AI"; then ai=on; else ai=off; fi
+          echo "value=$ai" >> "$GITHUB_OUTPUT"
+          for name in GROWTH_STORY MILESTONES INTERESTS TEACHER_THANKS; do
+            if is_off "${!name}"; then disabled=true; else disabled=false; fi
+            echo "disable_$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')=$disabled" >> "$GITHUB_OUTPUT"
+          done
 
       - name: Cache Ollama models
         id: ollama-cache
@@ -192,10 +280,12 @@ jobs:
           ollama pull llama3.1:8b
 
       - name: Mirror Kidsnote → Notion
+        if: steps.auth.outputs.ok == 'true'
         env:
-          KIDSNOTE_SESSION_COOKIE: ${{ secrets.KIDSNOTE_SESSION_COOKIE }}
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          # KIDSNOTE_SESSION_COOKIE comes from $GITHUB_ENV (set by the
+          # "Check login and settings" step). Setting it here would override it.
+          NOTION_TOKEN: ${{ secrets[format('NOTION_TOKEN{0}', matrix.slot.suffix)] || secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets[format('NOTION_DATABASE_ID{0}', matrix.slot.suffix)] }}
           # Tell notion_mirror.py where Ollama lives + which model to use
           OLLAMA_HOST: "http://localhost:11434"
           OLLAMA_MODEL: "llama3.1:8b"
@@ -210,12 +300,12 @@ jobs:
           # env names. Default behavior when the secret isn't set is
           # ``on`` (= DISABLE=false) so the AI on path lights up all 4
           # dashboards out of the box.
-          KIDSNOTE_CHILD_NAME: ${{ secrets.KIDSNOTE_CHILD_NAME || vars.KIDSNOTE_CHILD_NAME || '' }}
+          KIDSNOTE_CHILD_NAME: ${{ secrets[format('KIDSNOTE_CHILD_NAME{0}', matrix.slot.suffix)] || vars[format('KIDSNOTE_CHILD_NAME{0}', matrix.slot.suffix)] || '' }}
           DISABLE_ALL_LLM: ${{ steps.ai.outputs.value == 'on' && 'false' || 'true' }}
-          DISABLE_GROWTH_STORY: ${{ (secrets.GROWTH_STORY || vars.GROWTH_STORY) == 'off' && 'true' || 'false' }}
-          DISABLE_MILESTONES: ${{ (secrets.MILESTONES || vars.MILESTONES) == 'off' && 'true' || 'false' }}
-          DISABLE_INTERESTS: ${{ (secrets.INTERESTS || vars.INTERESTS) == 'off' && 'true' || 'false' }}
-          DISABLE_TEACHER_THANKS: ${{ (secrets.TEACHER_THANKS || vars.TEACHER_THANKS) == 'off' && 'true' || 'false' }}
+          DISABLE_GROWTH_STORY: ${{ steps.ai.outputs.disable_growth_story }}
+          DISABLE_MILESTONES: ${{ steps.ai.outputs.disable_milestones }}
+          DISABLE_INTERESTS: ${{ steps.ai.outputs.disable_interests }}
+          DISABLE_TEACHER_THANKS: ${{ steps.ai.outputs.disable_teacher_thanks }}
         run: |
           set -eu
           ARGS=( "--auth-mode" "session-cookie-env" "--publish-to-notion" "--no-local-save" )
@@ -228,17 +318,33 @@ jobs:
           if [ "${{ inputs.force_refresh }}" = "on" ]; then
             ARGS+=( "--force-refresh" )
           fi
+          if [ "${{ inputs.relabel }}" = "on" ]; then
+            ARGS+=( "--relabel-existing" )
+          fi
           python tools/kidsnote_fetch/fetch.py "${ARGS[@]}"
 
       - name: Verify required secrets were present
-        if: failure()
+        if: failure() && steps.auth.outputs.ok == 'true'
         env:
-          KIDSNOTE_SESSION_COOKIE: ${{ secrets.KIDSNOTE_SESSION_COOKIE }}
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          NOTION_TOKEN: ${{ secrets[format('NOTION_TOKEN{0}', matrix.slot.suffix)] || secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets[format('NOTION_DATABASE_ID{0}', matrix.slot.suffix)] }}
         run: |
-          for s in KIDSNOTE_SESSION_COOKIE NOTION_TOKEN NOTION_DATABASE_ID; do
+          for s in NOTION_TOKEN NOTION_DATABASE_ID; do
             if [ -z "${!s:-}" ]; then
               echo "::error::repo secret '$s' is empty or unset"
             fi
           done
+
+      # GitHub auto-disables scheduled workflows after 60 days without
+      # repo activity. That silently stopped this mirror on 2026-08-20
+      # (last commit 2026-05-28), so an expired cookie went unnoticed.
+      # Re-enabling via the API resets the inactivity timer without a
+      # dummy commit. always(): keep the schedule alive even when the
+      # mirror step fails — a red run that emails the operator beats a
+      # schedule that quietly disappears.
+      - name: Keep cron schedule alive
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/kidsnote-to-notion.yml/enable"

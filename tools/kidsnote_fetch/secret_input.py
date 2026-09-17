@@ -1,0 +1,60 @@
+"""Clean up setup values the way people actually paste them (stdlib only).
+
+Secrets typed into GitHub's form often carry a trailing newline, an invisible
+BOM or zero-width character, wrapping quotes, or, for Notion, a whole link
+instead of the bare id. Normalizing here turns those into working values
+instead of cryptic API errors.
+"""
+from __future__ import annotations
+
+import re
+from urllib.parse import urlsplit
+
+_INVISIBLE = re.compile("[﻿​‌‍⁠]")
+_NOTION_ID = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|[0-9a-fA-F]{32}"
+)
+
+
+def clean_secret(value: str | None) -> str:
+    """Drop invisible characters, surrounding whitespace and wrapping quotes."""
+    text = _INVISIBLE.sub("", value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return text
+
+
+def normalize_token(value: str | None) -> str:
+    """A Notion token, tolerating a pasted 'Bearer ' prefix."""
+    text = clean_secret(value)
+    if text.lower().startswith("bearer "):
+        text = text[len("bearer "):].strip()
+    return text
+
+
+def normalize_notion_id(value: str | None) -> str:
+    """32-hex Notion id from a bare id, a dashed UUID or any Notion link; '' if none is found.
+
+    Only the path of a link is searched: the `?v=` view id in a database link
+    is also 32 hex characters and must not win.
+    """
+    text = clean_secret(value)
+    if not text:
+        return ""
+    if "/" in text:
+        text = urlsplit(text if "://" in text else "https://" + text).path
+    else:
+        text = text.split("?", 1)[0].split("#", 1)[0]
+    ids = _NOTION_ID.findall(text)
+    return ids[-1].replace("-", "").lower() if ids else ""
+
+
+def mask_name(name: str | None) -> str:
+    """'우하린' -> '우*린': recognizable to the parent, but not a full name in public Actions logs."""
+    text = clean_secret(name)
+    if len(text) <= 1:
+        return "*" if text else ""
+    if len(text) == 2:
+        return text[0] + "*"
+    return text[0] + "*" * (len(text) - 2) + text[-1]
