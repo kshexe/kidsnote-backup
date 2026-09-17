@@ -13,16 +13,21 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Fast-forward main from upstream (redchupa/kidsnote-backup)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream (redchupa/kidsnote-backup) into main
         run: |
           set -euo pipefail
-          # GitHub's own "sync fork" API (same one behind the web UI's Sync
-          # fork button) - a fast-forward-only merge done server-side.
-          curl -fsSL -X POST \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/merge-upstream" \
-            -d '{"branch":"main"}'
+          # A real git merge, not GitHub's fast-forward-only "sync fork" API: this fork carries
+          # its own commits on top of upstream (starting with this very workflow file), so a
+          # fast-forward is never possible again once that first commit landed - the API call
+          # this replaced failed with 422 every day for exactly that reason.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/redchupa/kidsnote-backup.git
+          git fetch upstream main
+          git merge upstream/main --no-edit
+          git push origin main
