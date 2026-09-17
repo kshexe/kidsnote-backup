@@ -2,9 +2,9 @@ name: Sync fork with redchupa/kidsnote-backup
 
 on:
   schedule:
-    # ~08:00 KST daily (= 23:00 UTC the previous day). 7 minutes off the hour on purpose -
+    # ~08:08 KST daily (= 23:08 UTC the previous day). 8 minutes off the hour on purpose -
     # GitHub's own guidance is that on-the-hour schedules queue up and run late under load.
-    - cron: '7 23 * * *'
+    - cron: '8 23 * * *'
   workflow_dispatch: {}
 
 permissions:
